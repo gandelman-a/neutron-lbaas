@@ -380,7 +380,8 @@ class LoadBalancerPluginv2(loadbalancerv2.LoadBalancerPluginBaseV2):
     """
     supported_extension_aliases = ["lbaasv2",
                                    "lbaas_agent_schedulerv2",
-                                   "service-type"]
+                                   "service-type",
+                                    'akloadbalancerstatus']
     path_prefix = loadbalancerv2.LOADBALANCERV2_PREFIX
 
     agent_notifiers = (
