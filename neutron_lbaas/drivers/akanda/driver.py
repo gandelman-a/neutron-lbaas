@@ -1,4 +1,5 @@
-# Copyright 2015, A10 Networks
+# Copyright 2013 New Dream Network, LLC (DreamHost)
+# Copyright 2015 Rackspace
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -11,313 +12,339 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-from datetime import datetime
-from functools import wraps
-import threading
-import time
 
+import os
+import shutil
+import socket
+
+import netaddr
+from neutron.agent.linux import ip_lib
+from neutron.agent.linux import utils as linux_utils
+from neutron.common import exceptions
+from neutron.common import utils as n_utils
+from neutron.i18n import _LI, _LE, _LW
+from neutron.plugins.common import constants
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_serialization import jsonutils
 from oslo_utils import excutils
-import requests
+from oslo_utils import importutils
 
-from neutron_lbaas.drivers import driver_base
+from neutron_lbaas.agent import agent_device_driver
+from neutron_lbaas.services.loadbalancer import constants as lb_const
+from neutron_lbaas.services.loadbalancer import data_models
+from neutron_lbaas.services.loadbalancer.drivers.haproxy import jinja_cfg
+from neutron_lbaas.services.loadbalancer.drivers.haproxy \
+    import namespace_driver
 
 LOG = logging.getLogger(__name__)
-VERSION = "1.0.0"
+NS_PREFIX = 'qlbaas-'
+STATS_TYPE_BACKEND_REQUEST = 2
+STATS_TYPE_BACKEND_RESPONSE = '1'
+STATS_TYPE_SERVER_REQUEST = 4
+STATS_TYPE_SERVER_RESPONSE = '2'
+DRIVER_NAME = 'akanda'
 
-OPTS = [
-    cfg.StrOpt(
-        'base_url',
-        default='http://127.0.0.1:9876',
-        help=_('URL of Octavia controller root'),
-    ),
-    cfg.IntOpt(
-        'request_poll_interval',
-        default=3,
-        help=_('Interval in seconds to poll octavia when an entity is created,'
-               ' updated, or deleted.')
-    ),
-    cfg.IntOpt(
-        'request_poll_timeout',
-        default=100,
-        help=_('Time to stop polling octavia when a status of an entity does '
-               'not change.')
-    )
-]
-cfg.CONF.register_opts(OPTS, 'octavia')
+STATE_PATH_V2_APPEND = 'v2'
+
+cfg.CONF.register_opts(namespace_driver.OPTS, 'haproxy')
 
 
-def thread_op(manager, context, entity, delete=False):
-    poll_interval = cfg.CONF.octavia.request_poll_interval
-    poll_timeout = cfg.CONF.octavia.request_poll_timeout
-    start_dt = datetime.now()
-    prov_status = None
-    while (datetime.now() - start_dt).seconds < poll_timeout:
-        octavia_lb = manager.driver.load_balancer.get(entity.root_loadbalancer)
-        prov_status = octavia_lb.get('provisioning_status')
-        LOG.debug("Octavia reports load balancer {0} has provisioning status "
-                  "of {1}".format(entity.root_loadbalancer.id, prov_status))
-        if prov_status == 'ACTIVE' or prov_status == 'DELETED':
-            manager.successful_completion(context, entity, delete=delete)
-            return
-        elif prov_status == 'ERROR':
-            manager.failed_completion(context, entity)
-            return
-        time.sleep(poll_interval)
-    LOG.debug("Timeout has expired for load balancer {0} to complete an "
-              "operation.  The last reported status was "
-              "{1}".format(entity.root_loadbalancer.id, prov_status))
-    manager.failed_completion(context, entity)
+def get_ns_name(namespace_id):
+    return NS_PREFIX + namespace_id
 
 
-# A decorator for wrapping driver operations, which will automatically
-# set the neutron object's status based on whether it sees an exception
+class AkandaDriver(agent_device_driver.AgentDeviceDriver):
 
-def async_op(func):
-    @wraps(func)
-    def func_wrapper(*args, **kwargs):
-        d = (func.__name__ == 'delete')
-        try:
-            r = func(*args, **kwargs)
-            thread = threading.Thread(target=thread_op,
-                                      args=(args[0], args[1], args[2]),
-                                      kwargs={'delete': d})
-            thread.setDaemon(True)
-            thread.start()
-            return r
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                args[0].failed_completion(args[1], args[2])
-    return func_wrapper
+    def __init__(self, conf, plugin_rpc):
+        super(AkandaDriver, self).__init__(conf, plugin_rpc)
+        self._loadbalancer = LoadBalancerManager(self)
+        self._listener = ListenerManager(self)
+        self._pool = PoolManager(self)
+        self._member = MemberManager(self)
+        self._healthmonitor = HealthMonitorManager(self)
 
+    @property
+    def loadbalancer(self):
+        return self._loadbalancer
 
-class OctaviaRequest(object):
+    @property
+    def listener(self):
+        return self._listener
 
-    def __init__(self, base_url):
-        self.base_url = base_url
+    @property
+    def pool(self):
+        return self._pool
 
-    def request(self, method, url, args=None, headers=None):
-        if args:
-            if not headers:
-                headers = {
-                    'Content-type': 'application/json'
-                }
-            args = jsonutils.dumps(args)
-        LOG.debug("url = %s", '%s%s' % (self.base_url, str(url)))
-        LOG.debug("args = %s", args)
-        r = requests.request(method,
-                             '%s%s' % (self.base_url, str(url)),
-                             data=args,
-                             headers=headers)
-        LOG.debug("r = %s", r)
-        if method != 'DELETE':
-            return r.json()
+    @property
+    def member(self):
+        return self._member
 
-    def post(self, url, args):
-        return self.request('POST', url, args)
+    @property
+    def healthmonitor(self):
+        return self._healthmonitor
 
-    def put(self, url, args):
-        return self.request('PUT', url, args)
+    def get_name(self):
+        return DRIVER_NAME
 
-    def delete(self, url):
-        self.request('DELETE', url)
-
-    def get(self, url):
-        return self.request('GET', url)
-
-
-class AkandaDriver(driver_base.LoadBalancerBaseDriver):
-
-    def __init__(self, plugin):
-        super(AkandaDriver, self).__init__(plugin)
-
-        self.req = OctaviaRequest(cfg.CONF.octavia.base_url)
-
-        self.load_balancer = LoadBalancerManager(self)
-        self.listener = ListenerManager(self)
-        self.pool = PoolManager(self)
-        self.member = MemberManager(self)
-        self.health_monitor = HealthMonitorManager(self)
-
-        LOG.debug("Akanda: initialized, version=%s", VERSION)
-
-
-class LoadBalancerManager(driver_base.BaseLoadBalancerManager):
-
-    @staticmethod
-    def _url(lb, id=None):
-        s = '/v1/loadbalancers'
-        if id:
-            s += '/%s' % id
-        return s
-
-#    @async_op
-    def create(self, context, lb):
-        print "xxx CREATE %s" % lb
-        return
-        args = {
-            'id': lb.id,
-            'name': lb.name,
-            'description': lb.description,
-            'enabled': lb.admin_state_up,
-            'vip': {
-                'subnet_id': lb.vip_subnet_id,
-                'ip_address': lb.vip_address,
-                'port_id': lb.vip_port_id,
-            }
-        }
-        self.driver.req.post(self._url(lb), args)
-
-    def update(self, context, old_lb, lb):
-        print "xxx UPDATE %s" % lb
+    def undeploy_instance(self, loadbalancer_id, **kwargs):
         return
 
-    def delete(self, context, lb):
-        print 'xxx DELETE %s' % lb
+    def remove_orphans(self, known_loadbalancer_ids):
+        return
 
-    @async_op
-    def refresh(self, context, lb):
-        pass
+    def get_stats(self, loadbalancer_id):
+        return {}
 
-    def stats(self, context, lb):
-        return {}  # todo
+    def deploy_instance(self, loadbalancer):
+        return True
 
-    def get(self, lb):
-        print 'xxx GET %s' % lb
+#    def update(self, loadbalancer):
+#        pid_path = self._get_state_file_path(loadbalancer.id, 'haproxy.pid')
+#        extra_args = ['-sf']
+#        extra_args.extend(p.strip() for p in open(pid_path, 'r'))
+#        self._spawn(loadbalancer, extra_args)
+#
+#    def exists(self, loadbalancer_id):
+#        namespace = get_ns_name(loadbalancer_id)
+#        root_ns = ip_lib.IPWrapper()
+#
+#        socket_path = self._get_state_file_path(
+#            loadbalancer_id, 'haproxy_stats.sock', False)
+#        if root_ns.netns.exists(namespace) and os.path.exists(socket_path):
+#            try:
+#                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+#                s.connect(socket_path)
+#                return True
+#            except socket.error:
+#                pass
+#        return False
+#
+#    def create(self, loadbalancer):
+#        namespace = get_ns_name(loadbalancer.id)
+#
+#        self._plug(namespace, loadbalancer.vip_port, loadbalancer.vip_address)
+#        self._spawn(loadbalancer)
+#
+#    def deployable(self, loadbalancer):
+#        """Returns True if loadbalancer is active and has active listeners."""
+#        if not loadbalancer:
+#            return False
+#        acceptable_listeners = [
+#            listener for listener in loadbalancer.listeners
+#            if (listener.provisioning_status != constants.PENDING_DELETE and
+#                listener.admin_state_up)]
+#        return (bool(acceptable_listeners) and loadbalancer.admin_state_up and
+#                loadbalancer.provisioning_status != constants.PENDING_DELETE)
+#
+#    def _get_stats_from_socket(self, socket_path, entity_type):
+#        try:
+#            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+#            s.connect(socket_path)
+#            s.send('show stat -1 %s -1\n' % entity_type)
+#            raw_stats = ''
+#            chunk_size = 1024
+#            while True:
+#                chunk = s.recv(chunk_size)
+#                raw_stats += chunk
+#                if len(chunk) < chunk_size:
+#                    break
+#
+#            return self._parse_stats(raw_stats)
+#        except socket.error as e:
+#            LOG.warn(_LW('Error while connecting to stats socket: %s'), e)
+#            return {}
+#
+#    def _parse_stats(self, raw_stats):
+#        stat_lines = raw_stats.splitlines()
+#        if len(stat_lines) < 2:
+#            return []
+#        stat_names = [name.strip('# ') for name in stat_lines[0].split(',')]
+#        res_stats = []
+#        for raw_values in stat_lines[1:]:
+#            if not raw_values:
+#                continue
+#            stat_values = [value.strip() for value in raw_values.split(',')]
+#            res_stats.append(dict(zip(stat_names, stat_values)))
+#
+#        return res_stats
+#
+#    def _get_backend_stats(self, parsed_stats):
+#        for stats in parsed_stats:
+#            if stats.get('type') == STATS_TYPE_BACKEND_RESPONSE:
+#                unified_stats = dict((k, stats.get(v, ''))
+#                                     for k, v in jinja_cfg.STATS_MAP.items())
+#                return unified_stats
+#
+#        return {}
+#
+#    def _get_servers_stats(self, parsed_stats):
+#        res = {}
+#        for stats in parsed_stats:
+#            if stats.get('type') == STATS_TYPE_SERVER_RESPONSE:
+#                res[stats['svname']] = {
+#                    lb_const.STATS_STATUS: (constants.INACTIVE
+#                                            if stats['status'] == 'DOWN'
+#                                            else constants.ACTIVE),
+#                    lb_const.STATS_HEALTH: stats['check_status'],
+#                    lb_const.STATS_FAILED_CHECKS: stats['chkfail']
+#                }
+#        return res
+#
+#    def _get_state_file_path(self, loadbalancer_id, kind,
+#                             ensure_state_dir=True):
+#        """Returns the file name for a given kind of config file."""
+#        confs_dir = os.path.abspath(os.path.normpath(self.state_path))
+#        conf_dir = os.path.join(confs_dir, loadbalancer_id)
+#        if ensure_state_dir:
+#            n_utils.ensure_dir(conf_dir)
+#        return os.path.join(conf_dir, kind)
+#
+#    def _plug(self, namespace, port, vip_address, reuse_existing=True):
+#        self.plugin_rpc.plug_vip_port(port.id)
+#
+#        interface_name = self.vif_driver.get_device_name(port)
+#
+#        if ip_lib.device_exists(interface_name,
+#                                namespace=namespace):
+#            if not reuse_existing:
+#                raise exceptions.PreexistingDeviceFailure(
+#                    dev_name=interface_name
+#                )
+#        else:
+#            self.vif_driver.plug(
+#                port.network_id,
+#                port.id,
+#                interface_name,
+#                port.mac_address,
+#                namespace=namespace
+#            )
+#
+#        cidrs = [
+#            '%s/%s' % (ip.ip_address,
+#                       netaddr.IPNetwork(ip.subnet.cidr).prefixlen)
+#            for ip in port.fixed_ips
+#        ]
+#        self.vif_driver.init_l3(interface_name, cidrs, namespace=namespace)
+#
+#        # Haproxy socket binding to IPv6 VIP address will fail if this address
+#        # is not yet ready(i.e tentative address).
+#        if netaddr.IPAddress(vip_address).version == 6:
+#            device = ip_lib.IPDevice(interface_name, namespace=namespace)
+#            device.addr.wait_until_address_ready(vip_address)
+#
+#        gw_ip = port.fixed_ips[0].subnet.gateway_ip
+#
+#        if not gw_ip:
+#            host_routes = port.fixed_ips[0].subnet.host_routes
+#            for host_route in host_routes:
+#                if host_route.destination == "0.0.0.0/0":
+#                    gw_ip = host_route.nexthop
+#                    break
+#        else:
+#            cmd = ['route', 'add', 'default', 'gw', gw_ip]
+#            ip_wrapper = ip_lib.IPWrapper(namespace=namespace)
+#            ip_wrapper.netns.execute(cmd, check_exit_code=False)
+#            # When delete and re-add the same vip, we need to
+#            # send gratuitous ARP to flush the ARP cache in the Router.
+#            gratuitous_arp = self.conf.haproxy.send_gratuitous_arp
+#            if gratuitous_arp > 0:
+#                for ip in port.fixed_ips:
+#                    cmd_arping = ['arping', '-U',
+#                                  '-I', interface_name,
+#                                  '-c', gratuitous_arp,
+#                                  ip.ip_address]
+#                    ip_wrapper.netns.execute(cmd_arping, check_exit_code=False)
+#
+#    def _unplug(self, namespace, port):
+#        self.plugin_rpc.unplug_vip_port(port.id)
+#        interface_name = self.vif_driver.get_device_name(port)
+#        self.vif_driver.unplug(interface_name, namespace=namespace)
+#
+#    def _spawn(self, loadbalancer, extra_cmd_args=()):
+#        namespace = get_ns_name(loadbalancer.id)
+#        conf_path = self._get_state_file_path(loadbalancer.id, 'haproxy.conf')
+#        pid_path = self._get_state_file_path(loadbalancer.id,
+#                                             'haproxy.pid')
+#        sock_path = self._get_state_file_path(loadbalancer.id,
+#                                              'haproxy_stats.sock')
+#        user_group = self.conf.haproxy.user_group
+#        haproxy_base_dir = self._get_state_file_path(loadbalancer.id, '')
+#        jinja_cfg.save_config(conf_path,
+#                              loadbalancer,
+#                              sock_path,
+#                              user_group,
+#                              haproxy_base_dir)
+#        cmd = ['haproxy', '-f', conf_path, '-p', pid_path]
+#        cmd.extend(extra_cmd_args)
+#
+#        ns = ip_lib.IPWrapper(namespace=namespace)
+#        ns.netns.execute(cmd)
+#
+#        # remember deployed loadbalancer id
+#        self.deployed_loadbalancers[loadbalancer.id] = loadbalancer
+
+
+class LoadBalancerManager(agent_device_driver.BaseLoadBalancerManager):
+    def refresh(self, loadbalancer):
+        print 'xxx lb refresh'
+
+    def delete(self, loadbalancer):
+        print 'xxx lb delete'
+
+    def create(self, loadbalancer):
+        print 'xxx lb create'
+
+    def get_stats(self, loadbalancer_id):
+        return {}
+
+    def update(self, old_loadbalancer, loadbalancer):
+        print 'xxx lb update'
         return
 
 
-class ListenerManager(driver_base.BaseListenerManager):
+class ListenerManager(agent_device_driver.BaseListenerManager):
+    def update(self, old_listener, new_listener):
+        print 'xxx listener update'
 
-    @staticmethod
-    def _url(listener, id=None):
-        s = '/v1/loadbalancers/%s/listeners' % listener.loadbalancer.id
-        if id:
-            s += '/%s' % id
-        return s
+    def create(self, listener):
+        print 'xxx listener create'
 
-    @classmethod
-    def _write(cls, write_func, url, listener):
-        sni_container_ids = [sni.tls_container_id
-                             for sni in listener.sni_containers]
-        args = {
-            'id': listener.id,
-            'name': listener.name,
-            'description': listener.description,
-            'enabled': listener.admin_state_up,
-            'protocol': listener.protocol,
-            'protocol_port': listener.protocol_port,
-            'connection_limit': listener.connection_limit,
-            'tls_certificate_id': listener.default_tls_container_id,
-            'sni_containers': sni_container_ids,
-        }
-        write_func(cls._url(listener), args)
-
-    def create(self, context, listener):
-        pass
-
-    def update(self, context, old_listener, listener):
-        pass
-
-    def delete(self, context, listener):
-        pass
+    def delete(self, listener):
+        print 'xxx listener delete'
 
 
-class PoolManager(driver_base.BasePoolManager):
+class PoolManager(agent_device_driver.BasePoolManager):
+    def update(self, old_pool, new_pool):
+        print 'xxx pool update'
 
-    @staticmethod
-    def _url(pool, id=None):
-        s = '/v1/loadbalancers/%s/listeners/%s/pools' % (
-            pool.listener.loadbalancer.id,
-            pool.listener.id)
-        if id:
-            s += '/%s' % id
-        return s
-
-    @classmethod
-    def _write(cls, write_func, url, pool):
-        args = {
-            'id': pool.id,
-            'name': pool.name,
-            'description': pool.description,
-            'enabled': pool.admin_state_up,
-            'protocol': pool.protocol,
-            'lb_algorithm': pool.lb_algorithm,
-        }
-        if pool.session_persistence:
-            args['session_persistence'] = {
-                'type': pool.session_persistence.type,
-                'cookie_name': pool.session_persistence.cookie_name,
-            }
-        write_func(cls._url(pool), args)
-
-    def create(self, context, pool):
-        pass
-
-    def update(self, context, old_pool, pool):
-        pass
-
-    def delete(self, context, pool):
-        pass
+    def create(self, pool):
+        print 'xxx pool create'
 
 
-class MemberManager(driver_base.BaseMemberManager):
-
-    @staticmethod
-    def _url(member, id=None):
-        s = '/v1/loadbalancers/%s/listeners/%s/pools/%s/members' % (
-            member.pool.listener.loadbalancer.id,
-            member.pool.listener.id,
-            member.pool.id)
-        if id:
-            s += '/%s' % id
-        return s
-
-    def create(self, context, member):
-        pass
-
-    def update(self, context, old_member, member):
-        pass
-
-    def delete(self, context, member):
-        pass
+    def delete(self, pool):
+        print 'xxx pool delete'
 
 
-class HealthMonitorManager(driver_base.BaseHealthMonitorManager):
+class MemberManager(agent_device_driver.BaseMemberManager):
+    def update(self, old_member, new_member):
+        print 'xxx member update'
 
-    @staticmethod
-    def _url(hm):
-        s = '/v1/loadbalancers/%s/listeners/%s/pools/%s/healthmonitor' % (
-            hm.pool.listener.loadbalancer.id,
-            hm.pool.listener.id,
-            hm.pool.id)
-        return s
+    def create(self, member):
+        print 'xxx member create'
 
-    @classmethod
-    def _write(cls, write_func, url, hm):
-        args = {
-            'type': hm.type,
-            'delay': hm.delay,
-            'timeout': hm.timeout,
-            'rise_threshold': hm.max_retries,
-            'fall_threshold': hm.max_retries,
-            'http_method': hm.http_method,
-            'url_path': hm.url_path,
-            'expected_codes': hm.expected_codes,
-            'enabled': hm.admin_state_up,
-        }
-        write_func(cls._url(hm), args)
+    def delete(self, member):
+        print 'xxx member delete'
 
-    @async_op
-    def create(self, context, hm):
-        self._write(self.driver.req.post, self._url(hm), hm)
 
-    @async_op
-    def update(self, context, old_hm, hm):
-        self._write(self.driver.req.put, self._url(hm), hm)
+class HealthMonitorManager(agent_device_driver.BaseHealthMonitorManager):
 
-    @async_op
-    def delete(self, context, hm):
-        self.driver.req.delete(self._url(hm))
+    def update(self, old_hm, new_hm):
+        print 'xxx hm update'
+        self.driver.loadbalancer.refresh(new_hm.pool.listener.loadbalancer)
+
+    def create(self, hm):
+        print 'xxx hm create'
+
+    def delete(self, hm):
+        print 'xxx hm delete'
+
